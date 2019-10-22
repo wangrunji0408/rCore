@@ -1,3 +1,6 @@
+//! BCM2835 Secure Digital Host Controller Interface driver
+//! TODO: refactor, speed up
+
 #![allow(dead_code)]
 #![allow(unused_mut)]
 #![allow(unused_parens)]
@@ -7,12 +10,17 @@
 #![allow(unused_assignments)]
 #![allow(non_upper_case_globals)]
 
-use super::mailbox;
-use crate::thread;
+use alloc::string::String;
+use alloc::sync::Arc;
 use bcm2837::emmc::*;
 use core::mem;
 use core::slice;
 use core::time::Duration;
+
+use crate::arch::board::mailbox;
+use crate::drivers::{DeviceType, Driver, BLK_DRIVERS, DRIVERS, IRQ_MANAGER};
+use crate::sync::SpinNoIrqLock as Mutex;
+use crate::thread;
 
 pub const BLOCK_SIZE: usize = 512;
 
@@ -293,7 +301,7 @@ const SD_RESET_ALL: u32 = (1 << 24);
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct SDScr {
+struct SDScr {
     scr: [u32; 2],
     sd_bus_widths: u32,
     sd_version: u32,
@@ -309,7 +317,7 @@ impl SDScr {
     }
 }
 
-pub struct EmmcCtl {
+struct EmmcCtl {
     emmc: Emmc,
     card_supports_sdhc: bool,
     card_supports_18v: bool,
@@ -335,7 +343,7 @@ pub struct EmmcCtl {
 }
 
 fn usleep(cnt: usize) {
-    bcm2837::timer::delay_us(cnt);
+    bcm2837::timer::delay_us(cnt / 100);
 }
 
 fn byte_swap(b: u32) -> u32 {
@@ -948,7 +956,7 @@ impl EmmcCtl {
 
         usleep(2000);
 
-        self.block_size = 512;
+        self.block_size = BLOCK_SIZE;
         self.base_clock = base_clock;
 
         // Send CMD0 to the card (reset to idle state)
@@ -1270,7 +1278,12 @@ impl EmmcCtl {
         true
     }
 
-    pub fn read(&mut self, block_no_arg: u32, count: usize, buf: &mut [u32]) -> Result<(), ()> {
+    pub fn read_block(
+        &mut self,
+        block_no_arg: u32,
+        count: usize,
+        buf: &mut [u32],
+    ) -> Result<(), ()> {
         let mut block_no = block_no_arg;
         if !self.card_supports_sdhc {
             block_no *= 512;
@@ -1328,7 +1341,7 @@ impl EmmcCtl {
         Err(())
     }
 
-    pub fn write(&mut self, block_no_arg: u32, count: usize, buf: &[u32]) -> Result<(), ()> {
+    pub fn write_block(&mut self, block_no_arg: u32, count: usize, buf: &[u32]) -> Result<(), ()> {
         let mut block_no = block_no_arg;
         if !self.card_supports_sdhc {
             block_no *= 512;
@@ -1397,157 +1410,54 @@ impl EmmcCtl {
     }
 }
 
-use spin::Mutex;
+pub struct SDHCIDriver(Mutex<EmmcCtl>);
 
-lazy_static! {
-    pub static ref EMMC_CTL: Mutex<EmmcCtl> = Mutex::new(EmmcCtl::new());
-}
-
-fn demo() {
-    // print out the first section of the sd_card.
-    let section: [u8; 512] = [0; 512];
-    let buf = unsafe { slice::from_raw_parts_mut(section.as_ptr() as *mut u32, 512 / 4) };
-    println!("Trying to fetch the first section of the SD card.");
-    if !EMMC_CTL.lock().read(0, 1, buf).is_ok() {
-        error!("Failed in fetching.");
-        return;
-    }
-    println!("Content:");
-    for i in 0..32 {
-        for j in 0..16 {
-            print!("{:02X} ", section[i * 16 + j]);
-        }
-        println!("");
-    }
-    println!("");
-    if section[510] != 0x55 || section[511] != 0xAA {
-        println!("The first section is not an MBR section!");
-        println!("Maybe you are working on qemu using raw image.");
-        println!("Change the -sd argument to raspibian.img.");
-        return;
-    }
-    let mut start_pos = 446; // start position of the partion table
-    for entry in 0..4 {
-        print!("Partion entry #{}: ", entry);
-        let partion_type = section[start_pos + 0x4];
-        fn partion_type_map(partion_type: u8) -> &'static str {
-            match partion_type {
-                0x00 => "Empty",
-                0x0c => "FAT32",
-                0x83 => "Linux",
-                0x82 => "Swap",
-                _ => "Not supported",
-            }
-        }
-        print!("{:^14}", partion_type_map(partion_type));
-        if partion_type != 0x00 {
-            let start_section: u32 = (section[start_pos + 0x8] as u32)
-                | (section[start_pos + 0x9] as u32) << 8
-                | (section[start_pos + 0xa] as u32) << 16
-                | (section[start_pos + 0xb] as u32) << 24;
-            let total_section: u32 = (section[start_pos + 0xc] as u32)
-                | (section[start_pos + 0xd] as u32) << 8
-                | (section[start_pos + 0xe] as u32) << 16
-                | (section[start_pos + 0xf] as u32) << 24;
-            print!(
-                " start section no. = {}, a total of {} sections in use.",
-                start_section, total_section
-            );
-        }
-        println!("");
-        start_pos += 16;
-    }
-}
-
-fn demo_write() {
-    let section: [u8; 512] = [0; 512];
-    let mut deadbeef: [u8; 512] = [0; 512];
-    println!("Trying to fetch the second section of the SD card.");
-    if !EMMC_CTL
-        .lock()
-        .read(1, 1, unsafe {
-            slice::from_raw_parts_mut(section.as_ptr() as *mut u32, 512 / 4)
-        })
-        .is_ok()
-    {
-        error!("Failed in fetching.");
-        return;
-    }
-    println!("Content:");
-    for i in 0..32 {
-        for j in 0..16 {
-            print!("{:02X} ", section[i * 16 + j]);
-        }
-        println!("");
-    }
-    println!("");
-
-    for i in 0..512 / 4 {
-        deadbeef[i * 4 + 0] = 0xDE;
-        deadbeef[i * 4 + 1] = 0xAD;
-        deadbeef[i * 4 + 2] = 0xBE;
-        deadbeef[i * 4 + 3] = 0xEF;
+impl Driver for SDHCIDriver {
+    fn try_handle_interrupt(&self, _irq: Option<u32>) -> bool {
+        false
     }
 
-    if !EMMC_CTL
-        .lock()
-        .write(1, 1, unsafe {
-            slice::from_raw_parts(deadbeef.as_ptr() as *mut u32, 512 / 4)
-        })
-        .is_ok()
-    {
-        error!("Failed in writing.");
-        return;
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Block
     }
-    if !EMMC_CTL
-        .lock()
-        .read(1, 1, unsafe {
-            slice::from_raw_parts_mut(deadbeef.as_ptr() as *mut u32, 512 / 4)
-        })
-        .is_ok()
-    {
-        error!("Failed in checking.");
-        return;
+
+    fn get_id(&self) -> String {
+        format!("bcm2835_sdhci")
     }
-    println!("Re-fetched content:");
-    for i in 0..32 {
-        for j in 0..16 {
-            print!("{:02X} ", deadbeef[i * 16 + j]);
+
+    fn read_block(&self, block_id: usize, buf: &mut [u8]) -> bool {
+        if buf.len() < BLOCK_SIZE {
+            return false;
         }
-        println!("");
+        let buf = unsafe { slice::from_raw_parts_mut(buf.as_ptr() as *mut u32, BLOCK_SIZE / 4) };
+        self.0.lock().read_block(block_id as u32, 1, buf).is_ok()
     }
-    println!("");
-    if !EMMC_CTL
-        .lock()
-        .write(1, 1, unsafe {
-            slice::from_raw_parts(section.as_ptr() as *mut u32, 512 / 4)
-        })
-        .is_ok()
-    {
-        error!("Failed in writing back.");
-        return;
-    }
-    for i in 0..512 / 4 {
-        if deadbeef[i * 4 + 0] != 0xDE
-            || deadbeef[i * 4 + 1] != 0xAD
-            || deadbeef[i * 4 + 2] != 0xBE
-            || deadbeef[i * 4 + 3] != 0xEF
-        {
-            error!("Re-fetched content is wrong!");
-            return;
+
+    fn write_block(&self, block_id: usize, buf: &[u8]) -> bool {
+        if buf.len() < BLOCK_SIZE {
+            return false;
         }
+        let buf = unsafe { slice::from_raw_parts(buf.as_ptr() as *mut u32, BLOCK_SIZE / 4) };
+        self.0.lock().write_block(block_id as u32, 1, buf).is_ok()
     }
-    println!("Passed write() check.");
 }
 
 pub fn init() {
     debug!("Initializing EmmcCtl...");
-    if EMMC_CTL.lock().init() == 0 {
-        debug!("EmmcCtl successfully initialized.");
-        //demo();
-        //demo_write();
-        info!("emmc: init end");
+    let mut ctrl = EmmcCtl::new();
+    if ctrl.init() == 0 {
+        let driver = Arc::new(SDHCIDriver(Mutex::new(ctrl)));
+
+        // test
+        // use super::test::*;
+        // test_read(driver.clone());
+        // test_write(driver.clone());
+
+        DRIVERS.write().push(driver.clone());
+        IRQ_MANAGER.write().register_all(driver.clone());
+        BLK_DRIVERS.write().push(driver);
+        info!("BCM2835 sdhci: successfully initialized");
     } else {
-        info!("emmc: init failed");
+        warn!("BCM2835 sdhci: init failed");
     }
 }
